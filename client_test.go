@@ -63,6 +63,14 @@ func mustClient(t *testing.T, baseURL string, opts ...Option) *Client {
 
 func intPtr(i int) *int           { return &i }
 func floatPtr(f float64) *float64 { return &f }
+func boolPtr(b bool) *bool        { return &b }
+
+// dataEnvelopeWithNext wraps a JSON value in the standard envelope and includes
+// a meta.next pagination token.
+func dataEnvelopeWithNext(inner, next string) string {
+	nextJSON, _ := json.Marshal(next) // produces a quoted, escaped JSON string
+	return `{"data":` + inner + `,"meta":{"duration":0.1,"endpoint":"/test","success":true,"next":` + string(nextJSON) + `}}`
+}
 
 // --- NewClient ---
 
@@ -272,6 +280,33 @@ func TestVessels_InRadius_MissingCenter(t *testing.T) {
 	}
 }
 
+func TestVessels_InRadius_IncludeNullType(t *testing.T) {
+	cap := &capture{}
+	srv := newServer(t, 200, dataEnvelope(`{"point":{"lat":1,"lon":2,"radius":50},"total":0,"vessels":[]}`), cap)
+	c := mustClient(t, srv.URL)
+
+	_, err := c.Vessels.InRadius(VesselInRadiusParams{Lat: floatPtr(1), Lon: floatPtr(2), Radius: 50, IncludeNullType: boolPtr(false)})
+	if err != nil {
+		t.Fatalf("InRadius: %v", err)
+	}
+	if cap.query.Get("_empty_") != "false" {
+		t.Fatalf("_empty_ not sent as false: %v", cap.query)
+	}
+}
+
+func TestVessels_InRadius_PaginationNext(t *testing.T) {
+	srv := newServer(t, 200, dataEnvelopeWithNext(`{"point":{"lat":1,"lon":2,"radius":50},"total":1,"vessels":[{"uuid":"a","distance":1}]}`, "ir-token"), nil)
+	c := mustClient(t, srv.URL)
+
+	res, err := c.Vessels.InRadius(VesselInRadiusParams{Lat: floatPtr(1), Lon: floatPtr(2), Radius: 50})
+	if err != nil {
+		t.Fatalf("InRadius: %v", err)
+	}
+	if res.Next != "ir-token" {
+		t.Fatalf("expected next token from meta, got %q", res.Next)
+	}
+}
+
 // --- Vessels.History ---
 
 func TestVessels_History_HappyPath(t *testing.T) {
@@ -336,7 +371,7 @@ func TestVessels_Find_HappyPath_TypeMapsToType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
-	if len(res) != 1 || res[0].Name != "FIND" {
+	if len(res.Items) != 1 || res.Items[0].Name != "FIND" {
 		t.Fatalf("unexpected find: %+v", res)
 	}
 	if cap.query.Get("type") != "cargo" {
@@ -344,6 +379,87 @@ func TestVessels_Find_HappyPath_TypeMapsToType(t *testing.T) {
 	}
 	if cap.query.Get("fuzzy") != "1" {
 		t.Fatalf("fuzzy not passed: %v", cap.query)
+	}
+}
+
+func TestVessels_Find_IncludeNullType(t *testing.T) {
+	cap := &capture{}
+	srv := newServer(t, 200, dataEnvelope(`[{"uuid":"v-1","name":"FIND"}]`), cap)
+	c := mustClient(t, srv.URL)
+
+	_, err := c.Vessels.Find(VesselFindParams{VesselType: "cargo", IncludeNullType: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if cap.query.Get("_empty_") != "true" {
+		t.Fatalf("_empty_ not sent as true: %v", cap.query)
+	}
+}
+
+func TestVessels_Find_IncludeNullType_CountsAsSearch(t *testing.T) {
+	cap := &capture{}
+	srv := newServer(t, 200, dataEnvelope(`[]`), cap)
+	c := mustClient(t, srv.URL)
+
+	// IncludeNullType alone, with no other filter, must satisfy the guard.
+	_, err := c.Vessels.Find(VesselFindParams{IncludeNullType: boolPtr(false)})
+	if err != nil {
+		t.Fatalf("IncludeNullType should satisfy search guard: %v", err)
+	}
+	if cap.query.Get("_empty_") != "false" {
+		t.Fatalf("_empty_ not sent as false: %v", cap.query)
+	}
+}
+
+func TestVessels_Find_IncludeNullType_TrueSatisfiesGuard(t *testing.T) {
+	cap := &capture{}
+	srv := newServer(t, 200, dataEnvelope(`[]`), cap)
+	c := mustClient(t, srv.URL)
+	_, err := c.Vessels.Find(VesselFindParams{IncludeNullType: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("IncludeNullType=true alone should satisfy guard: %v", err)
+	}
+	if cap.query.Get("_empty_") != "true" {
+		t.Fatalf("_empty_ not set to true: %v", cap.query)
+	}
+}
+
+func TestVessels_Find_NextParamIsForwarded(t *testing.T) {
+	cap := &capture{}
+	srv := newServer(t, 200, dataEnvelope(`[]`), cap)
+	c := mustClient(t, srv.URL)
+	_, err := c.Vessels.Find(VesselFindParams{VesselType: "cargo", Next: "tok123"})
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if cap.query.Get("next") != "tok123" {
+		t.Fatalf("next param not forwarded: %v", cap.query)
+	}
+}
+
+func TestVessels_InRadius_NextParamIsForwarded(t *testing.T) {
+	cap := &capture{}
+	srv := newServer(t, 200, dataEnvelope(`{"point":{"lat":1,"lon":2,"radius":10},"total":0,"vessels":[]}`), cap)
+	c := mustClient(t, srv.URL)
+	_, err := c.Vessels.InRadius(VesselInRadiusParams{Lat: floatPtr(1), Lon: floatPtr(2), Radius: 10, Next: "page2"})
+	if err != nil {
+		t.Fatalf("InRadius: %v", err)
+	}
+	if cap.query.Get("next") != "page2" {
+		t.Fatalf("next param not forwarded: %v", cap.query)
+	}
+}
+
+func TestVessels_Find_PaginationNext(t *testing.T) {
+	srv := newServer(t, 200, dataEnvelopeWithNext(`[{"uuid":"v-1","name":"FIND"}]`, "page-token-2"), nil)
+	c := mustClient(t, srv.URL)
+
+	res, err := c.Vessels.Find(VesselFindParams{VesselType: "cargo"})
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if res.Next != "page-token-2" {
+		t.Fatalf("expected next token from meta, got %q", res.Next)
 	}
 }
 

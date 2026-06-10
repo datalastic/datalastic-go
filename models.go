@@ -59,6 +59,9 @@ type VesselInRadiusResult struct {
 	} `json:"point"`
 	Total   int              `json:"total"`
 	Vessels []VesselWithDist `json:"vessels"`
+	// Next is the pagination token from meta.next; populated from the response
+	// envelope, not the data body, so it carries no json tag.
+	Next string
 }
 
 // VesselWithDist is a Vessel with an additional distance field.
@@ -90,6 +93,13 @@ type VesselPosition struct {
 	Destination       string  `json:"destination"`
 	LastPositionEpoch int64   `json:"last_position_epoch"`
 	LastPositionUTC   string  `json:"last_position_UTC"`
+}
+
+// VesselFindResult is returned by the vessel_find endpoint. Items holds the
+// matched vessels; Next is the meta.next pagination token for the next page.
+type VesselFindResult struct {
+	Items []VesselInfo
+	Next  string
 }
 
 // VesselInfo contains static vessel specifications.

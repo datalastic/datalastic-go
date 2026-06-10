@@ -50,7 +50,10 @@ type VesselInRadiusParams struct {
 	TypeSpecific string
 	Exclude      string
 	NavStatus    *int
-	Next         string
+	// IncludeNullType maps to the _empty_ param: include/exclude null-type
+	// vessels.
+	IncludeNullType *bool
+	Next            string
 }
 
 // VesselHistoryParams requests historical positions for a vessel.
@@ -80,6 +83,9 @@ type VesselFindParams struct {
 	BreadthMax      *float64
 	YearBuiltMin    *int
 	YearBuiltMax    *int
+	// IncludeNullType maps to the _empty_ param: include/exclude null-type
+	// vessels. Counts as a search filter, like VesselType.
+	IncludeNullType *bool
 	Next            string
 }
 
@@ -161,13 +167,25 @@ func (r *VesselsResource) InRadius(p VesselInRadiusParams) (*VesselInRadiusResul
 	addString(v, "type_specific", p.TypeSpecific)
 	addString(v, "exclude", p.Exclude)
 	addOptionalInt(v, "nav_status", p.NavStatus)
+	if p.IncludeNullType != nil {
+		if *p.IncludeNullType {
+			v.Set("_empty_", "true")
+		} else {
+			v.Set("_empty_", "false")
+		}
+	}
 	addString(v, "next", p.Next)
 
-	raw, err := r.client.do(r.client.baseV0, "vessel_inradius", v)
+	raw, next, err := r.client.doWithNext(r.client.baseV0, "vessel_inradius", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[VesselInRadiusResult](raw, "vessel_inradius")
+	result, err := decodeInto[VesselInRadiusResult](raw, "vessel_inradius")
+	if err != nil {
+		return nil, err
+	}
+	result.Next = next
+	return result, nil
 }
 
 // History returns historical positions for a vessel.
@@ -206,7 +224,7 @@ func (r *VesselsResource) Info(p VesselParams) (*VesselInfo, error) {
 // Find searches the static vessel database. At least one of VesselType,
 // TypeSpecific, CountryISO, or a range bound is required; Fuzzy and Next alone
 // are not sufficient.
-func (r *VesselsResource) Find(p VesselFindParams) ([]VesselInfo, error) {
+func (r *VesselsResource) Find(p VesselFindParams) (*VesselFindResult, error) {
 	v := url.Values{}
 	addString(v, "name", p.Name)
 	addOptionalInt(v, "fuzzy", p.Fuzzy)
@@ -214,6 +232,14 @@ func (r *VesselsResource) Find(p VesselFindParams) ([]VesselInfo, error) {
 
 	searchCount := 0
 	if p.Name != "" {
+		searchCount++
+	}
+	if p.IncludeNullType != nil {
+		if *p.IncludeNullType {
+			v.Set("_empty_", "true")
+		} else {
+			v.Set("_empty_", "false")
+		}
 		searchCount++
 	}
 	if p.VesselType != "" {
@@ -238,11 +264,15 @@ func (r *VesselsResource) Find(p VesselFindParams) ([]VesselInfo, error) {
 		return nil, &DatalasticError{Message: "at least one search parameter is required (fuzzy and next do not count)"}
 	}
 
-	raw, err := r.client.do(r.client.baseV0, "vessel_find", v)
+	raw, next, err := r.client.doWithNext(r.client.baseV0, "vessel_find", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeSlice[VesselInfo](raw, "vessel_find")
+	items, err := decodeSlice[VesselInfo](raw, "vessel_find")
+	if err != nil {
+		return nil, err
+	}
+	return &VesselFindResult{Items: items, Next: next}, nil
 }
 
 // Estimated returns a satellite-estimated position for a vessel. Uses the

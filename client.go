@@ -105,6 +105,7 @@ type envelope struct {
 		Duration interface{} `json:"duration"`
 		Endpoint string      `json:"endpoint"`
 		Success  bool        `json:"success"`
+		Next     string      `json:"next"`
 	} `json:"meta"`
 }
 
@@ -121,6 +122,13 @@ type errorBody struct {
 // do executes a GET request against base+path, appending the api-key query
 // parameter, and returns the parsed data payload.
 func (c *Client) do(base, path string, params url.Values) (json.RawMessage, error) {
+	raw, _, err := c.doWithNext(base, path, params)
+	return raw, err
+}
+
+// doWithNext executes a GET request like do() but also returns the meta.next
+// pagination token from the response envelope.
+func (c *Client) doWithNext(base, path string, params url.Values) (json.RawMessage, string, error) {
 	if params == nil {
 		params = url.Values{}
 	}
@@ -131,16 +139,16 @@ func (c *Client) do(base, path string, params url.Values) (json.RawMessage, erro
 
 	resp, err := c.httpClient.Get(fullURL)
 	if err != nil {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("request failed: %v", redactKey(err.Error(), c.apiKey))}}
+		return nil, "", &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("request failed: %v", redactKey(err.Error(), c.apiKey))}}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to read response body: %v", err)}, StatusCode: resp.StatusCode}
+		return nil, "", &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to read response body: %v", err)}, StatusCode: resp.StatusCode}
 	}
 
-	return parseResponse(resp.StatusCode, body)
+	return parseResponseFull(resp.StatusCode, body)
 }
 
 // post executes a POST request with a JSON body. The api-key is injected into
@@ -173,35 +181,43 @@ func (c *Client) post(base, path string, body map[string]interface{}) (json.RawM
 }
 
 // parseResponse maps HTTP status codes to typed errors and validates the
-// response envelope.
+// response envelope, returning only the data payload.
 func parseResponse(status int, body []byte) (json.RawMessage, error) {
+	data, _, err := parseResponseFull(status, body)
+	return data, err
+}
+
+// parseResponseFull maps HTTP status codes to typed errors and validates the
+// response envelope, returning the data payload and the meta.next pagination
+// token.
+func parseResponseFull(status int, body []byte) (json.RawMessage, string, error) {
 	if status >= 400 {
 		msg := extractErrorMessage(body, status)
 		base := DatalasticError{Message: msg}
 		switch status {
 		case http.StatusUnauthorized:
-			return nil, &AuthenticationError{DatalasticError: base, StatusCode: status}
+			return nil, "", &AuthenticationError{DatalasticError: base, StatusCode: status}
 		case http.StatusPaymentRequired:
-			return nil, &InsufficientCreditsError{DatalasticError: base, StatusCode: status}
+			return nil, "", &InsufficientCreditsError{DatalasticError: base, StatusCode: status}
 		case http.StatusNotFound:
-			return nil, &NotFoundError{DatalasticError: base, StatusCode: status}
+			return nil, "", &NotFoundError{DatalasticError: base, StatusCode: status}
 		case http.StatusTooManyRequests:
-			return nil, &RateLimitError{DatalasticError: base, StatusCode: status}
+			return nil, "", &RateLimitError{DatalasticError: base, StatusCode: status}
 		default:
-			return nil, &APIError{DatalasticError: base, StatusCode: status}
+			return nil, "", &APIError{DatalasticError: base, StatusCode: status}
 		}
 	}
 
 	var env envelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("invalid JSON response: %v", err)}, StatusCode: status}
+		return nil, "", &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("invalid JSON response: %v", err)}, StatusCode: status}
 	}
 
 	if len(env.Data) == 0 || string(env.Data) == "null" {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: "response missing 'data' field"}, StatusCode: status}
+		return nil, "", &APIError{DatalasticError: DatalasticError{Message: "response missing 'data' field"}, StatusCode: status}
 	}
 
-	return env.Data, nil
+	return env.Data, env.Meta.Next, nil
 }
 
 // extractErrorMessage pulls a human-readable message from an error body, falling
