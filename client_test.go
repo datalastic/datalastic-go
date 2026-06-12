@@ -18,6 +18,7 @@ type capture struct {
 	query  url.Values
 	body   map[string]interface{}
 	method string
+	header http.Header
 }
 
 // newServer returns an httptest.Server that records the request into cap and
@@ -29,6 +30,7 @@ func newServer(t *testing.T, status int, body string, cap *capture) *httptest.Se
 			cap.path = r.URL.Path
 			cap.query = r.URL.Query()
 			cap.method = r.Method
+			cap.header = r.Header
 			if r.Method == http.MethodPost {
 				raw, _ := io.ReadAll(r.Body)
 				m := map[string]interface{}{}
@@ -115,8 +117,11 @@ func TestStat_HappyPath(t *testing.T) {
 	if stat.UserID != "u1" || stat.RequestsRemaining != 90 {
 		t.Fatalf("unexpected stat: %+v", stat)
 	}
-	if cap.query.Get("api-key") != "test-key" {
-		t.Fatalf("api-key not in query: %v", cap.query)
+	if cap.header.Get("x-api-key") != "test-key" {
+		t.Fatalf("x-api-key header not sent: %v", cap.header)
+	}
+	if cap.query.Get("api-key") != "" {
+		t.Fatalf("api-key must not appear in query: %v", cap.query)
 	}
 	if cap.path != "/stat" {
 		t.Fatalf("unexpected path: %s", cap.path)
@@ -727,7 +732,7 @@ func TestIntel_Companies_HappyPath(t *testing.T) {
 
 // --- Reports ---
 
-func TestReports_Submit_PostsApiKeyInBody(t *testing.T) {
+func TestReports_Submit_SendsApiKeyInHeader(t *testing.T) {
 	cap := &capture{}
 	srv := newServer(t, 200, dataEnvelope(`{"report_id":"r-1","report_type":"fleet","status":"queued"}`), cap)
 	c := mustClient(t, srv.URL)
@@ -742,8 +747,11 @@ func TestReports_Submit_PostsApiKeyInBody(t *testing.T) {
 	if cap.method != http.MethodPost {
 		t.Fatalf("expected POST, got %s", cap.method)
 	}
-	if cap.body["api-key"] != "test-key" {
-		t.Fatalf("api-key not in body: %v", cap.body)
+	if cap.header.Get("x-api-key") != "test-key" {
+		t.Fatalf("x-api-key header not sent: %v", cap.header)
+	}
+	if _, ok := cap.body["api-key"]; ok {
+		t.Fatalf("api-key must not appear in body: %v", cap.body)
 	}
 	if cap.body["report_type"] != "fleet" || cap.body["imo"] != "9999" {
 		t.Fatalf("body fields missing: %v", cap.body)
@@ -1020,6 +1028,21 @@ func TestConnectionError_KeyNotLeaked(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatalf("API key leaked in error: %v", err)
+	}
+}
+
+func TestPost_ConnectionError_KeyNotLeaked(t *testing.T) {
+	const secret = "super-secret-key-12345"
+	c, err := NewClient(secret, withBaseURLs("http://127.0.0.1:1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Reports.Submit(ReportSubmitParams{ReportType: "x"})
+	if err == nil {
+		t.Fatal("expected connection error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("API key leaked in POST error: %v", err)
 	}
 }
 

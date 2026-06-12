@@ -57,14 +57,14 @@ All Intel methods use the `maritime_reports` base URL and are add-ons.
 ### Reports — `client.Reports.*`
 | Method | Params / arg | Description |
 |---|---|---|
-| `Submit` | `ReportSubmitParams` | Submit a generic async report job (POST, api-key in body) |
+| `Submit` | `ReportSubmitParams` | Submit a generic async report job (POST, x-api-key header) |
 | `InRadiusHistory` | `InRadiusHistoryParams` | Async historical area scan: all vessels in radius over a date range |
 | `Get` | `reportID string` | Poll a report job by ID |
 | `ListAll` | — | All report jobs for this key |
 
 ## Key Conventions
 
-- **Auth is a query param, not a header.** Every GET appends `?api-key=...`; every POST injects `"api-key"` into the JSON body.
+- **Auth is an HTTP header.** Both GET and POST requests set `x-api-key` on the request header. The key never appears in the URL query string or JSON body.
 - **Three base URLs:** `BaseV0` (`/api/v0`) for core endpoints; `BaseExt` (`/api/ext`) for `Estimated` and `Calculate`; `BaseMR` (`/api/maritime_reports`) for all Intel methods.
 - **Bulk uses repeated params:** `vessel_bulk` sends multiple `mmsi=` / `imo=` / `uuid=` values via `url.Values.Add`.
 - **`VesselFindParams.VesselType` maps to the `type` query key** — not `vessel_type`.

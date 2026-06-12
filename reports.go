@@ -15,7 +15,7 @@ type ReportSubmitParams struct {
 	Extra      map[string]interface{}
 }
 
-// Submit creates a new report job. The api-key is sent in the POST body.
+// Submit creates a new report job. The api-key is sent in the x-api-key header.
 func (r *ReportsResource) Submit(p ReportSubmitParams) (*Report, error) {
 	if p.ReportType == "" {
 		return nil, &DatalasticError{Message: "report_type is required"}

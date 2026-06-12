@@ -1,6 +1,6 @@
 // Package datalastic is a Go SDK for the Datalastic Maritime API.
 //
-// Authentication uses an api-key passed as a query parameter on every request.
+// Authentication uses an x-api-key HTTP header on every request.
 // The client exposes resource groups for vessels, ports, sea routes, maritime
 // intelligence reports, and asynchronous report jobs.
 package datalastic
@@ -119,8 +119,8 @@ type errorBody struct {
 	Error   string `json:"error"`
 }
 
-// do executes a GET request against base+path, appending the api-key query
-// parameter, and returns the parsed data payload.
+// do executes a GET request against base+path and returns the parsed data
+// payload. Authentication is sent via the x-api-key header.
 func (c *Client) do(base, path string, params url.Values) (json.RawMessage, error) {
 	raw, _, err := c.doWithNext(base, path, params)
 	return raw, err
@@ -132,12 +132,17 @@ func (c *Client) doWithNext(base, path string, params url.Values) (json.RawMessa
 	if params == nil {
 		params = url.Values{}
 	}
-	params.Set("api-key", c.apiKey)
 
 	fullURL := strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
 	fullURL += "?" + params.Encode()
 
-	resp, err := c.httpClient.Get(fullURL)
+	req, err := http.NewRequest("GET", fullURL, nil)
+	if err != nil {
+		return nil, "", &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("request failed: %v", redactKey(err.Error(), c.apiKey))}}
+	}
+	req.Header.Set("x-api-key", c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, "", &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("request failed: %v", redactKey(err.Error(), c.apiKey))}}
 	}
@@ -151,13 +156,12 @@ func (c *Client) doWithNext(base, path string, params url.Values) (json.RawMessa
 	return parseResponseFull(resp.StatusCode, body)
 }
 
-// post executes a POST request with a JSON body. The api-key is injected into
-// the body map.
+// post executes a POST request with a JSON body. The api-key is sent in the
+// x-api-key header.
 func (c *Client) post(base, path string, body map[string]interface{}) (json.RawMessage, error) {
 	if body == nil {
 		body = map[string]interface{}{}
 	}
-	body["api-key"] = c.apiKey
 
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -166,7 +170,14 @@ func (c *Client) post(base, path string, body map[string]interface{}) (json.RawM
 
 	fullURL := strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
 
-	resp, err := c.httpClient.Post(fullURL, "application/json", bytes.NewReader(payload))
+	req, err := http.NewRequest("POST", fullURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("request failed: %v", redactKey(err.Error(), c.apiKey))}}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("request failed: %v", redactKey(err.Error(), c.apiKey))}}
 	}
@@ -268,17 +279,13 @@ func (c *Client) Stat() (*ApiStat, error) {
 	return &out, nil
 }
 
-// redactKey replaces every occurrence of key (raw and URL-encoded) in s with
-// "[REDACTED]" so that API keys are not leaked in error messages.
+// redactKey replaces every occurrence of key in s with "[REDACTED]" so that
+// API keys are not leaked in error messages.
 func redactKey(s, key string) string {
 	if key == "" {
 		return s
 	}
-	s = strings.ReplaceAll(s, key, "[REDACTED]")
-	if encoded := url.QueryEscape(key); encoded != key {
-		s = strings.ReplaceAll(s, encoded, "[REDACTED]")
-	}
-	return s
+	return strings.ReplaceAll(s, key, "[REDACTED]")
 }
 
 // --- shared parameter helpers ---

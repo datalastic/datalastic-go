@@ -32,7 +32,7 @@ Requires Go 1.21 or later.
 
 ## Authentication
 
-Pass your API key once at construction. The SDK injects it automatically as a query parameter (`api-key`) on every request.
+Pass your API key once at construction. The SDK injects it automatically as an `x-api-key` HTTP header on every request.
 
 ```go
 client, err := datalastic.NewClient("YOUR_API_KEY")
@@ -192,7 +192,7 @@ companies, err := client.Intel.Companies(datalastic.CompanyParams{CompanyIMO: "1
 Reports are asynchronous. Submit a job, then poll with `Get` until the status is `_DONE_`.
 
 ```go
-// Submit an async job (api-key is sent in the POST body)
+// Submit an async job (api-key is sent in the x-api-key header)
 report, err := client.Reports.Submit(datalastic.ReportSubmitParams{
     ReportType: "fleet_movement",
     Extra:      map[string]interface{}{"imo": "9379785"},
