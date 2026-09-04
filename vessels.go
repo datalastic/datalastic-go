@@ -95,11 +95,16 @@ func (r *VesselsResource) Get(p VesselParams) (*Vessel, error) {
 	if err != nil {
 		return nil, err
 	}
-	raw, err := r.client.do(r.client.baseV0, "vessel", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "vessel", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[Vessel](raw, "vessel")
+	out, err := decodeInto[Vessel](raw, "vessel", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }
 
 // Pro returns extended tracking data including ETA, ATD, and port info.
@@ -108,11 +113,16 @@ func (r *VesselsResource) Pro(p VesselParams) (*VesselPro, error) {
 	if err != nil {
 		return nil, err
 	}
-	raw, err := r.client.do(r.client.baseV0, "vessel_pro", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "vessel_pro", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[VesselPro](raw, "vessel_pro")
+	out, err := decodeInto[VesselPro](raw, "vessel_pro", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }
 
 // Bulk returns tracking data for multiple vessels in one request.
@@ -136,11 +146,16 @@ func (r *VesselsResource) Bulk(p VesselBulkParams) (*VesselBulkResult, error) {
 	if len(v) == 0 {
 		return nil, &DatalasticError{Message: "at least one mmsi, imo, or uuid is required"}
 	}
-	raw, err := r.client.do(r.client.baseV0, "vessel_bulk", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "vessel_bulk", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[VesselBulkResult](raw, "vessel_bulk")
+	out, err := decodeInto[VesselBulkResult](raw, "vessel_bulk", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }
 
 // InRadius scans for vessels within a radius of a coordinate or port.
@@ -176,15 +191,16 @@ func (r *VesselsResource) InRadius(p VesselInRadiusParams) (*VesselInRadiusResul
 	}
 	addString(v, "next", p.Next)
 
-	raw, next, err := r.client.doWithNext(r.client.baseV0, "vessel_inradius", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "vessel_inradius", v)
 	if err != nil {
 		return nil, err
 	}
-	result, err := decodeInto[VesselInRadiusResult](raw, "vessel_inradius")
+	result, err := decodeInto[VesselInRadiusResult](raw, "vessel_inradius", r.client.apiKey)
 	if err != nil {
 		return nil, err
 	}
-	result.Next = next
+	result.Meta = meta
+	result.Next = meta.Next
 	return result, nil
 }
 
@@ -201,11 +217,16 @@ func (r *VesselsResource) History(p VesselHistoryParams) (*VesselHistory, error)
 	addString(v, "from", p.From)
 	addString(v, "to", p.To)
 
-	raw, err := r.client.do(r.client.baseV0, "vessel_history", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "vessel_history", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[VesselHistory](raw, "vessel_history")
+	out, err := decodeInto[VesselHistory](raw, "vessel_history", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }
 
 // Info returns static vessel specifications.
@@ -214,16 +235,21 @@ func (r *VesselsResource) Info(p VesselParams) (*VesselInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	raw, err := r.client.do(r.client.baseV0, "vessel_info", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "vessel_info", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[VesselInfo](raw, "vessel_info")
+	out, err := decodeInto[VesselInfo](raw, "vessel_info", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }
 
-// Find searches the static vessel database. At least one of VesselType,
-// TypeSpecific, CountryISO, or a range bound is required; Fuzzy and Next alone
-// are not sufficient.
+// Find searches the static vessel database. At least one of Name, VesselType,
+// TypeSpecific, CountryISO, IncludeNullType, or a range bound is required;
+// Fuzzy and Next alone are not sufficient.
 func (r *VesselsResource) Find(p VesselFindParams) (*VesselFindResult, error) {
 	v := url.Values{}
 	addString(v, "name", p.Name)
@@ -264,15 +290,15 @@ func (r *VesselsResource) Find(p VesselFindParams) (*VesselFindResult, error) {
 		return nil, &DatalasticError{Message: "at least one search parameter is required (fuzzy and next do not count)"}
 	}
 
-	raw, next, err := r.client.doWithNext(r.client.baseV0, "vessel_find", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "vessel_find", v)
 	if err != nil {
 		return nil, err
 	}
-	items, err := decodeSlice[VesselInfo](raw, "vessel_find")
+	items, err := decodeSlice[VesselInfo](raw, "vessel_find", r.client.apiKey)
 	if err != nil {
 		return nil, err
 	}
-	return &VesselFindResult{Items: items, Next: next}, nil
+	return &VesselFindResult{Meta: meta, Items: items, Next: meta.Next}, nil
 }
 
 // Estimated returns a satellite-estimated position for a vessel. Uses the
@@ -282,27 +308,36 @@ func (r *VesselsResource) Estimated(p VesselParams) (*VesselEstimated, error) {
 	if err != nil {
 		return nil, err
 	}
-	raw, err := r.client.do(r.client.baseExt, "vessel_pro_est", v)
+	raw, meta, err := r.client.do(r.client.baseExt, "vessel_pro_est", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[VesselEstimated](raw, "vessel_pro_est")
+	out, err := decodeInto[VesselEstimated](raw, "vessel_pro_est", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }
 
 // --- decode helpers ---
+//
+// Both helpers take the API key so a decoder error, which can quote the payload
+// it failed on, is redacted like every other error the SDK returns. They stay
+// free functions because Go methods cannot be generic.
 
-func decodeInto[T any](raw json.RawMessage, ctx string) (*T, error) {
+func decodeInto[T any](raw json.RawMessage, ctx, apiKey string) (*T, error) {
 	var out T
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to decode %s: %v", ctx, err)}}
+		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to decode %s: %v", ctx, redactKey(err.Error(), apiKey))}}
 	}
 	return &out, nil
 }
 
-func decodeSlice[T any](raw json.RawMessage, ctx string) ([]T, error) {
+func decodeSlice[T any](raw json.RawMessage, ctx, apiKey string) ([]T, error) {
 	var out []T
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to decode %s: %v", ctx, err)}}
+		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to decode %s: %v", ctx, redactKey(err.Error(), apiKey))}}
 	}
 	return out, nil
 }

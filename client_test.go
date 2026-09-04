@@ -7,18 +7,25 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// capture records the request the test server received.
+// capture records the request the test server received. rawURL, requestURI, and
+// rawBody are kept verbatim so tests can assert that the API key never appears
+// anywhere on the wire except the x-api-key header.
 type capture struct {
-	path   string
-	query  url.Values
-	body   map[string]interface{}
-	method string
-	header http.Header
+	path       string
+	query      url.Values
+	body       map[string]interface{}
+	rawBody    []byte
+	method     string
+	header     http.Header
+	rawURL     string
+	requestURI string
 }
 
 // newServer returns an httptest.Server that records the request into cap and
@@ -30,9 +37,15 @@ func newServer(t *testing.T, status int, body string, cap *capture) *httptest.Se
 			cap.path = r.URL.Path
 			cap.query = r.URL.Query()
 			cap.method = r.Method
-			cap.header = r.Header
+			cap.header = r.Header.Clone()
+			cap.rawURL = r.URL.String()
+			cap.requestURI = r.RequestURI
 			if r.Method == http.MethodPost {
-				raw, _ := io.ReadAll(r.Body)
+				raw, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read request body: %v", err)
+				}
+				cap.rawBody = raw
 				m := map[string]interface{}{}
 				_ = json.Unmarshal(raw, &m)
 				cap.body = m
@@ -52,14 +65,21 @@ func dataEnvelope(inner string) string {
 	return `{"data":` + inner + `,"meta":{"duration":0.1,"endpoint":"/test","success":true}}`
 }
 
-// mustClient builds a Client pointed at baseURL.
+// mustClient builds a Client pointed at baseURL. The retry sleep is replaced
+// with a no-op: no test in this package ever waits for real.
 func mustClient(t *testing.T, baseURL string, opts ...Option) *Client {
+	return mustClientKey(t, "test-key", baseURL, opts...)
+}
+
+// mustClientKey is mustClient with an explicit API key.
+func mustClientKey(t *testing.T, key, baseURL string, opts ...Option) *Client {
 	t.Helper()
 	all := append([]Option{withBaseURLs(baseURL)}, opts...)
-	c, err := NewClient("test-key", all...)
+	c, err := NewClient(key, all...)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
+	c.sleep = func(time.Duration) {}
 	return c
 }
 
@@ -515,10 +535,7 @@ func TestVessels_Estimated_RoutesToExtBase(t *testing.T) {
 	// different servers.
 	cap := &capture{}
 	extSrv := newServer(t, 200, dataEnvelope(`{"uuid":"v-1"}`), cap)
-	c, err := NewClient("test-key")
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := mustClient(t, extSrv.URL)
 	c.baseV0 = "http://127.0.0.1:1" // unreachable
 	c.baseExt = extSrv.URL
 	c.baseMR = "http://127.0.0.1:1"
@@ -560,7 +577,7 @@ func TestPorts_Find_RequiresSearchParam(t *testing.T) {
 
 func TestPorts_Get_HappyPath(t *testing.T) {
 	cap := &capture{}
-	inner := `{"uuid":"p-1","port_name":"ROTTERDAM","terminals":[{"terminal_code":"T1","terminal_name":"APM"}]}`
+	inner := `{"uuid":"p-1","port_name":"ROTTERDAM","terminals":[{"terminal_code":"T1","terminal_name":"NORTH TERMINAL"}]}`
 	srv := newServer(t, 200, dataEnvelope(inner), cap)
 	c := mustClient(t, srv.URL)
 
@@ -568,7 +585,7 @@ func TestPorts_Get_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if pd.PortName != "ROTTERDAM" || len(pd.Terminals) != 1 || pd.Terminals[0].TerminalName != "APM" {
+	if pd.PortName != "ROTTERDAM" || len(pd.Terminals) != 1 || pd.Terminals[0].TerminalName != "NORTH TERMINAL" {
 		t.Fatalf("unexpected port detail: %+v", pd)
 	}
 	if cap.path != "/port" {
@@ -825,12 +842,19 @@ func TestWithTimeout_ClonesClient(t *testing.T) {
 }
 
 func TestWithTimeout_Enforced(t *testing.T) {
+	// The handler blocks until the test is done, so the client timeout is what
+	// ends the request and nothing in the test waits on a wall clock.
+	// Retries are disabled: a client timeout is a retryable network error on
+	// GET, and this test is about the timeout firing, not about retrying it.
+	block := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(200 * time.Millisecond)
+		<-block
 		_, _ = io.WriteString(w, dataEnvelope(`{}`))
 	}))
 	t.Cleanup(srv.Close)
-	c := mustClient(t, srv.URL, WithTimeout(20*time.Millisecond))
+	t.Cleanup(func() { close(block) }) // runs before srv.Close, which waits for handlers
+
+	c := mustClient(t, srv.URL, WithTimeout(20*time.Millisecond), WithMaxRetries(0))
 	_, err := c.Stat()
 	if err == nil {
 		t.Fatal("expected timeout error")
@@ -844,11 +868,8 @@ func TestWithTimeout_Enforced(t *testing.T) {
 // --- Transport / parsing errors ---
 
 func TestConnectionError_IsAPIError(t *testing.T) {
-	c, err := NewClient("k", withBaseURLs("http://127.0.0.1:1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = c.Stat()
+	c := mustClientKey(t, "k", "http://127.0.0.1:1")
+	_, err := c.Stat()
 	if err == nil {
 		t.Fatal("expected connection error")
 	}
@@ -981,10 +1002,7 @@ func TestVessels_Find_FloatRangeCounts(t *testing.T) {
 }
 
 func TestPost_ConnectionError_IsAPIError(t *testing.T) {
-	c, err := NewClient("k", withBaseURLs("http://127.0.0.1:1"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := mustClientKey(t, "k", "http://127.0.0.1:1")
 	if _, err := c.Reports.Submit(ReportSubmitParams{ReportType: "x"}); err == nil {
 		t.Fatal("expected connection error on POST")
 	} else {
@@ -1018,11 +1036,8 @@ func TestRoutes_Calculate_CorrectPath(t *testing.T) {
 
 func TestConnectionError_KeyNotLeaked(t *testing.T) {
 	const secret = "super-secret-key-12345"
-	c, err := NewClient(secret, withBaseURLs("http://127.0.0.1:1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = c.Stat()
+	c := mustClientKey(t, secret, "http://127.0.0.1:1")
+	_, err := c.Stat()
 	if err == nil {
 		t.Fatal("expected connection error")
 	}
@@ -1033,11 +1048,8 @@ func TestConnectionError_KeyNotLeaked(t *testing.T) {
 
 func TestPost_ConnectionError_KeyNotLeaked(t *testing.T) {
 	const secret = "super-secret-key-12345"
-	c, err := NewClient(secret, withBaseURLs("http://127.0.0.1:1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = c.Reports.Submit(ReportSubmitParams{ReportType: "x"})
+	c := mustClientKey(t, secret, "http://127.0.0.1:1")
+	_, err := c.Reports.Submit(ReportSubmitParams{ReportType: "x"})
 	if err == nil {
 		t.Fatal("expected connection error")
 	}
@@ -1139,5 +1151,345 @@ func TestPorts_Find_RadiusWithoutLatLon_NotSent(t *testing.T) {
 	}
 	if cap.query.Get("radius") != "" {
 		t.Fatalf("radius should not be sent without lat/lon, got: %v", cap.query)
+	}
+}
+
+// --- Option validation ---
+
+func TestOptions_Rejected(t *testing.T) {
+	cases := []struct {
+		name string
+		opt  Option
+		want string // substring the message must carry
+	}{
+		{"timeout zero", WithTimeout(0), "WithTimeout"},
+		{"timeout negative", WithTimeout(-1 * time.Second), "-1s"},
+		{"nil http client", WithHTTPClient(nil), "WithHTTPClient"},
+		{"negative max retries", WithMaxRetries(-1), "-1"},
+		{"negative backoff", WithBackoffFactor(-time.Millisecond), "WithBackoffFactor"},
+		{"negative retry-after max", WithRetryAfterMax(-time.Second), "WithRetryAfterMax"},
+		{"status 600", WithRetryOnStatus(600), "600"},
+		{"status 407", WithRetryOnStatus(407), "407"},
+		{"status 200", WithRetryOnStatus(200), "200"},
+		{"status 401", WithRetryOnStatus(401), "401"},
+		{"status 402", WithRetryOnStatus(402), "402"},
+		{"status 404", WithRetryOnStatus(404), "404"},
+		{"mixed good and bad status", WithRetryOnStatus(429, 403), "403"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := NewClient("k", tc.opt)
+			if err == nil {
+				t.Fatal("expected construction error")
+			}
+			if c != nil {
+				t.Fatalf("expected nil client on error, got %+v", c)
+			}
+			var de *DatalasticError
+			if !errors.As(err, &de) {
+				t.Fatalf("expected DatalasticError, got %T", err)
+			}
+			if !strings.Contains(de.Message, tc.want) {
+				t.Fatalf("message %q does not mention %q", de.Message, tc.want)
+			}
+		})
+	}
+}
+
+func TestOptions_AcceptedBoundaries(t *testing.T) {
+	cases := []struct {
+		name  string
+		opt   Option
+		check func(t *testing.T, c *Client)
+	}{
+		{"timeout 1ns", WithTimeout(time.Nanosecond), func(t *testing.T, c *Client) {
+			if c.httpClient.Timeout != time.Nanosecond {
+				t.Fatalf("timeout not applied: %v", c.httpClient.Timeout)
+			}
+		}},
+		{"max retries 0", WithMaxRetries(0), func(t *testing.T, c *Client) {
+			if c.maxRetries != 0 {
+				t.Fatalf("maxRetries = %d, want 0", c.maxRetries)
+			}
+		}},
+		{"backoff 0", WithBackoffFactor(0), func(t *testing.T, c *Client) {
+			if c.backoffFactor != 0 {
+				t.Fatalf("backoffFactor = %v, want 0", c.backoffFactor)
+			}
+		}},
+		{"retry-after ceiling 0", WithRetryAfterMax(0), func(t *testing.T, c *Client) {
+			if c.retryAfterMax != 0 {
+				t.Fatalf("retryAfterMax = %v, want 0", c.retryAfterMax)
+			}
+		}},
+		{"empty retry status set", WithRetryOnStatus(), func(t *testing.T, c *Client) {
+			if len(c.retryStatuses) != 0 {
+				t.Fatalf("retryStatuses = %v, want empty", c.retryStatuses)
+			}
+			if c.retriesStatus(429) {
+				t.Fatal("429 must not be retried after an empty WithRetryOnStatus")
+			}
+		}},
+		{"full legal status set", WithRetryOnStatus(408, 429, 500, 599), func(t *testing.T, c *Client) {
+			for _, code := range []int{408, 429, 500, 599} {
+				if !c.retriesStatus(code) {
+					t.Fatalf("status %d not retried", code)
+				}
+			}
+			if c.retriesStatus(600) {
+				t.Fatal("600 must not be in the retry set")
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := NewClient("k", tc.opt)
+			if err != nil {
+				t.Fatalf("unexpected construction error: %v", err)
+			}
+			tc.check(t, c)
+		})
+	}
+}
+
+func TestOptions_FirstErrorWins(t *testing.T) {
+	_, err := NewClient("k", WithMaxRetries(-2), WithTimeout(0))
+	if err == nil {
+		t.Fatal("expected construction error")
+	}
+	if !strings.Contains(err.Error(), "WithMaxRetries") {
+		t.Fatalf("expected the first failure to be reported, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "WithTimeout") {
+		t.Fatalf("expected only the first failure, got %q", err.Error())
+	}
+}
+
+func TestOptions_NilOptionRejected(t *testing.T) {
+	c, err := NewClient("k", nil)
+	if err == nil {
+		t.Fatal("expected construction error for a nil option")
+	}
+	if c != nil {
+		t.Fatal("expected nil client")
+	}
+}
+
+func TestNewClient_Defaults(t *testing.T) {
+	c, err := NewClient("k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.maxRetries != 3 {
+		t.Fatalf("maxRetries = %d, want 3", c.maxRetries)
+	}
+	if c.backoffFactor != 500*time.Millisecond {
+		t.Fatalf("backoffFactor = %v, want 500ms", c.backoffFactor)
+	}
+	if c.retryAfterMax != 60*time.Second {
+		t.Fatalf("retryAfterMax = %v, want 60s", c.retryAfterMax)
+	}
+	if !c.retriesStatus(429) || len(c.retryStatuses) != 1 {
+		t.Fatalf("default retry statuses = %v, want {429}", c.retryStatuses)
+	}
+	if c.httpClient.Timeout != 30*time.Second {
+		t.Fatalf("default timeout = %v, want 30s", c.httpClient.Timeout)
+	}
+	if c.sleep == nil || c.now == nil {
+		t.Fatal("sleep and now seams must be set")
+	}
+}
+
+// --- Version and User-Agent ---
+
+func TestVersion_IsSemver(t *testing.T) {
+	re := regexp.MustCompile(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$`)
+	if !re.MatchString(Version) {
+		t.Fatalf("Version %q is not strict semver", Version)
+	}
+	if userAgent != "datalastic-go/"+Version {
+		t.Fatalf("userAgent %q does not embed Version %q", userAgent, Version)
+	}
+}
+
+func TestUserAgent_SentOnGetAndPost(t *testing.T) {
+	t.Run("GET", func(t *testing.T) {
+		cap := &capture{}
+		srv := newServer(t, 200, dataEnvelope(`{"user_id":"u1"}`), cap)
+		c := mustClient(t, srv.URL)
+		if _, err := c.Stat(); err != nil {
+			t.Fatalf("Stat: %v", err)
+		}
+		if got := cap.header.Get("User-Agent"); got != userAgent {
+			t.Fatalf("User-Agent = %q, want %q", got, userAgent)
+		}
+	})
+	t.Run("POST", func(t *testing.T) {
+		cap := &capture{}
+		srv := newServer(t, 200, dataEnvelope(`{"report_id":"r-1"}`), cap)
+		c := mustClient(t, srv.URL)
+		if _, err := c.Reports.Submit(ReportSubmitParams{ReportType: "fleet"}); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		if got := cap.header.Get("User-Agent"); got != userAgent {
+			t.Fatalf("User-Agent = %q, want %q", got, userAgent)
+		}
+	})
+}
+
+// --- Auth transport ---
+
+// distinctKey is deliberately unlike any other string in a request so a leak
+// into the URL or body is unambiguous.
+const distinctKey = "sk-distinct-9f8e7d"
+
+func TestAuth_KeyNeverInGetURL(t *testing.T) {
+	cap := &capture{}
+	srv := newServer(t, 200, dataEnvelope(`{"uuid":"v-1"}`), cap)
+	c := mustClientKey(t, distinctKey, srv.URL)
+
+	if _, err := c.Vessels.Get(VesselParams{MMSI: "123"}); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if cap.header.Get("x-api-key") != distinctKey {
+		t.Fatalf("x-api-key header = %q", cap.header.Get("x-api-key"))
+	}
+	if strings.Contains(cap.rawURL, distinctKey) {
+		t.Fatalf("api key leaked into request URL: %s", cap.rawURL)
+	}
+	if strings.Contains(cap.requestURI, distinctKey) {
+		t.Fatalf("api key leaked into request URI: %s", cap.requestURI)
+	}
+	for key, vals := range cap.query {
+		for _, v := range vals {
+			if strings.Contains(v, distinctKey) {
+				t.Fatalf("api key leaked into query param %q", key)
+			}
+		}
+	}
+}
+
+func TestAuth_KeyNeverInPostURLOrBody(t *testing.T) {
+	cap := &capture{}
+	srv := newServer(t, 200, dataEnvelope(`{"report_id":"r-1"}`), cap)
+	c := mustClientKey(t, distinctKey, srv.URL)
+
+	_, err := c.Reports.Submit(ReportSubmitParams{ReportType: "fleet", Extra: map[string]interface{}{"imo": "9999"}})
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if cap.header.Get("x-api-key") != distinctKey {
+		t.Fatalf("x-api-key header = %q", cap.header.Get("x-api-key"))
+	}
+	if strings.Contains(cap.rawURL, distinctKey) || strings.Contains(cap.requestURI, distinctKey) {
+		t.Fatalf("api key leaked into POST URL: %s %s", cap.rawURL, cap.requestURI)
+	}
+	if strings.Contains(string(cap.rawBody), distinctKey) {
+		t.Fatalf("api key leaked into POST body: %s", cap.rawBody)
+	}
+}
+
+func TestAuth_HeaderSentByEveryResource(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		call func(c *Client) error
+	}{
+		{"Stat", dataEnvelope(`{"user_id":"u1"}`), func(c *Client) error {
+			_, err := c.Stat()
+			return err
+		}},
+		{"Vessels.Get", dataEnvelope(`{"uuid":"v-1"}`), func(c *Client) error {
+			_, err := c.Vessels.Get(VesselParams{IMO: "9999"})
+			return err
+		}},
+		{"Ports.Find", dataEnvelope(`[]`), func(c *Client) error {
+			_, err := c.Ports.Find(PortFindParams{CountryISO: "NL"})
+			return err
+		}},
+		{"Ports.Get", dataEnvelope(`{"uuid":"p-1"}`), func(c *Client) error {
+			_, err := c.Ports.Get(PortGetParams{Unlocode: "NLRTM"})
+			return err
+		}},
+		{"Routes.Calculate", dataEnvelope(`{"from":{},"to":{},"route":{}}`), func(c *Client) error {
+			_, err := c.Routes.Calculate(RouteParams{PortUUIDFrom: "a", PortUUIDTo: "b"})
+			return err
+		}},
+		{"Intel.DryDock", dataEnvelope(`[]`), func(c *Client) error {
+			_, err := c.Intel.DryDock(IntelDryDockParams{IMO: "9999"})
+			return err
+		}},
+		{"Intel.Companies", dataEnvelope(`[]`), func(c *Client) error {
+			_, err := c.Intel.Companies(CompanyParams{CompanyIMO: "1234567"})
+			return err
+		}},
+		{"Reports.Get", dataEnvelope(`{"report_id":"r-1"}`), func(c *Client) error {
+			_, err := c.Reports.Get("r-1")
+			return err
+		}},
+		{"Reports.ListAll", dataEnvelope(`[]`), func(c *Client) error {
+			_, err := c.Reports.ListAll()
+			return err
+		}},
+		{"Reports.Submit", dataEnvelope(`{"report_id":"r-1"}`), func(c *Client) error {
+			_, err := c.Reports.Submit(ReportSubmitParams{ReportType: "fleet"})
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cap := &capture{}
+			srv := newServer(t, 200, tc.body, cap)
+			c := mustClientKey(t, distinctKey, srv.URL)
+			if err := tc.call(c); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if cap.header.Get("x-api-key") != distinctKey {
+				t.Fatalf("%s: x-api-key header = %q", tc.name, cap.header.Get("x-api-key"))
+			}
+			if strings.Contains(cap.rawURL, distinctKey) || strings.Contains(string(cap.rawBody), distinctKey) {
+				t.Fatalf("%s: api key leaked on the wire", tc.name)
+			}
+		})
+	}
+}
+
+func TestResponseBodyReadFailure_IsAPIError(t *testing.T) {
+	// The handler promises more bytes than it sends and then aborts, so the
+	// client fails while reading the body rather than while connecting.
+	// WithMaxRetries(0) isolates the shape of the error from the retry policy:
+	// exactly one request is made, and TestRetry_TruncatedBodyRetriedOnGet
+	// covers the retrying case.
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"data":`)
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := mustClient(t, srv.URL, WithMaxRetries(0))
+	_, err := c.Stat()
+	if err == nil {
+		t.Fatal("expected a body read error")
+	}
+	var ae *APIError
+	if !errors.As(err, &ae) {
+		t.Fatalf("expected APIError, got %T: %v", err, err)
+	}
+	if ae.StatusCode != 200 {
+		t.Fatalf("StatusCode = %d, want 200", ae.StatusCode)
+	}
+	if !strings.Contains(ae.Message, "failed to read response body") {
+		t.Fatalf("message should say what failed, got %q", ae.Message)
+	}
+	if !strings.Contains(ae.Message, "after 1 attempt(s)") {
+		t.Fatalf("message should report the attempt count, got %q", ae.Message)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1 with retries disabled", got)
 	}
 }

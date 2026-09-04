@@ -1,7 +1,112 @@
 package datalastic
 
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+)
+
+// Meta is the metadata half of the API response envelope. Typed fields cover
+// the documented keys; Raw holds every key of the meta object verbatim, so
+// counters and flags that this SDK version does not model yet stay reachable
+// without waiting for a release.
+//
+// A response that carries no meta object yields a non-nil Meta with Success nil
+// and an empty Raw.
+type Meta struct {
+	// Success is nil when the response carried no explicit success key.
+	Success *bool
+	// Message is the API-supplied message, typically set when Success is false.
+	Message string
+	// Next is the pagination token for the next page, empty on the last page.
+	Next string
+	// Endpoint is the endpoint path the API reports having served.
+	Endpoint string
+	// Duration is the server-side processing time in seconds. It tolerates a
+	// JSON number or a numeric string; an unparseable value leaves it zero.
+	Duration float64
+	// Raw is every key of the meta object, unparsed.
+	Raw map[string]json.RawMessage
+}
+
+// UnmarshalJSON populates Raw and the typed fields together, so the two views
+// of the metadata can never disagree. Individual keys that cannot be parsed
+// into their typed field are left at their zero value and remain available in
+// Raw; a meta value that is not a JSON object is an error.
+func (m *Meta) UnmarshalJSON(b []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return fmt.Errorf("meta is not a JSON object: %w", err)
+	}
+	*m = Meta{Raw: raw}
+	if v, ok := raw["success"]; ok {
+		if parsed, ok := jsonBool(v); ok {
+			m.Success = &parsed
+		}
+	}
+	m.Message = jsonString(raw["message"])
+	m.Next = jsonString(raw["next"])
+	m.Endpoint = jsonString(raw["endpoint"])
+	if v, ok := raw["duration"]; ok {
+		if parsed, ok := jsonFloat(v); ok {
+			m.Duration = parsed
+		}
+	}
+	return nil
+}
+
+// jsonString decodes a JSON string, returning "" for absent or non-string
+// values.
+func jsonString(v json.RawMessage) string {
+	if len(v) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(v, &s); err != nil {
+		return ""
+	}
+	return s
+}
+
+// jsonBool decodes a JSON boolean, also accepting a quoted boolean.
+func jsonBool(v json.RawMessage) (bool, bool) {
+	var b bool
+	if err := json.Unmarshal(v, &b); err == nil {
+		return b, true
+	}
+	var s string
+	if err := json.Unmarshal(v, &s); err == nil {
+		if parsed, err := strconv.ParseBool(s); err == nil {
+			return parsed, true
+		}
+	}
+	return false, false
+}
+
+// jsonFloat decodes a JSON number, also accepting a quoted number.
+func jsonFloat(v json.RawMessage) (float64, bool) {
+	var f float64
+	if err := json.Unmarshal(v, &f); err == nil {
+		return f, true
+	}
+	var s string
+	if err := json.Unmarshal(v, &s); err == nil {
+		if parsed, err := strconv.ParseFloat(s, 64); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
 // Vessel represents basic AIS tracking data.
 type Vessel struct {
+	// Meta is the response envelope metadata for the call that produced this
+	// value. It is populated from the envelope, not the data body.
+	//
+	// VesselPro and VesselEstimated embed Vessel, so they expose this field by
+	// promotion rather than declaring their own.
+	Meta *Meta `json:"-"`
+
 	UUID              string  `json:"uuid"`
 	Name              string  `json:"name"`
 	MMSI              string  `json:"mmsi"`
@@ -46,12 +151,20 @@ type VesselEstimated struct {
 
 // VesselBulkResult is returned by the bulk tracking endpoint.
 type VesselBulkResult struct {
+	// Meta is the response envelope metadata for the call that produced this
+	// value. It is populated from the envelope, not the data body.
+	Meta *Meta `json:"-"`
+
 	Total   int      `json:"total"`
 	Vessels []Vessel `json:"vessels"`
 }
 
 // VesselInRadiusResult is returned by the in-radius scan endpoint.
 type VesselInRadiusResult struct {
+	// Meta is the response envelope metadata for the call that produced this
+	// value. It is populated from the envelope, not the data body.
+	Meta *Meta `json:"-"`
+
 	Point struct {
 		Lat    float64 `json:"lat"`
 		Lon    float64 `json:"lon"`
@@ -59,12 +172,16 @@ type VesselInRadiusResult struct {
 	} `json:"point"`
 	Total   int              `json:"total"`
 	Vessels []VesselWithDist `json:"vessels"`
-	// Next is the pagination token from meta.next; populated from the response
-	// envelope, not the data body, so it carries no json tag.
+	// Next mirrors Meta.Next, the pagination token for the next page. It comes
+	// from the response envelope, not the data body, so it carries no json tag.
 	Next string
 }
 
 // VesselWithDist is a Vessel with an additional distance field.
+//
+// It appears only inside the Vessels slice of an in-radius result, so its
+// promoted Meta field stays nil: the envelope metadata belongs to the enclosing
+// VesselInRadiusResult, which carries it.
 type VesselWithDist struct {
 	Vessel
 	Distance float64 `json:"distance"`
@@ -72,6 +189,10 @@ type VesselWithDist struct {
 
 // VesselHistory contains historical position data for a vessel.
 type VesselHistory struct {
+	// Meta is the response envelope metadata for the call that produced this
+	// value. It is populated from the envelope, not the data body.
+	Meta *Meta `json:"-"`
+
 	UUID         string           `json:"uuid"`
 	Name         string           `json:"name"`
 	MMSI         string           `json:"mmsi"`
@@ -96,14 +217,23 @@ type VesselPosition struct {
 }
 
 // VesselFindResult is returned by the vessel_find endpoint. Items holds the
-// matched vessels; Next is the meta.next pagination token for the next page.
+// matched vessels; Next mirrors Meta.Next, the pagination token for the next
+// page.
 type VesselFindResult struct {
+	// Meta is the response envelope metadata for the call that produced this
+	// value. It is populated from the envelope, not the data body.
+	Meta *Meta `json:"-"`
+
 	Items []VesselInfo
 	Next  string
 }
 
 // VesselInfo contains static vessel specifications.
 type VesselInfo struct {
+	// Meta is the response envelope metadata for the call that produced this
+	// value. It is populated from the envelope, not the data body.
+	Meta *Meta `json:"-"`
+
 	UUID         string   `json:"uuid"`
 	Name         string   `json:"name"`
 	NameAIS      string   `json:"name_ais"`
@@ -157,6 +287,10 @@ type Terminal struct {
 
 // PortDetail is the response from the /port endpoint, including terminals.
 type PortDetail struct {
+	// Meta is the response envelope metadata for the call that produced this
+	// value. It is populated from the envelope, not the data body.
+	Meta *Meta `json:"-"`
+
 	Port
 	Terminals []Terminal `json:"terminals"`
 }
@@ -179,6 +313,10 @@ type SeaRouteLineString struct {
 
 // SeaRoute is the result of a sea route calculation.
 type SeaRoute struct {
+	// Meta is the response envelope metadata for the call that produced this
+	// value. It is populated from the envelope, not the data body.
+	Meta *Meta `json:"-"`
+
 	From  SeaRoutePoint      `json:"from"`
 	Route SeaRouteLineString `json:"route"`
 	To    SeaRoutePoint      `json:"to"`
@@ -186,6 +324,10 @@ type SeaRoute struct {
 
 // ApiStat contains API key usage statistics.
 type ApiStat struct {
+	// Meta is the response envelope metadata for the call that produced this
+	// value. It is populated from the envelope, not the data body.
+	Meta *Meta `json:"-"`
+
 	UserID            string `json:"user_id"`
 	KeyStatus         string `json:"key_status"`
 	RequestsMade      int    `json:"requests_made"`
@@ -194,6 +336,10 @@ type ApiStat struct {
 
 // Report represents an async report job.
 type Report struct {
+	// Meta is the response envelope metadata for the call that produced this
+	// value. It is populated from the envelope, not the data body.
+	Meta *Meta `json:"-"`
+
 	ReportID   string                 `json:"report_id"`
 	ReportType string                 `json:"report_type"`
 	Status     string                 `json:"status"`

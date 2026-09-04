@@ -24,13 +24,38 @@ const (
 	BaseMR  = "https://api.datalastic.com/api/maritime_reports"
 )
 
-// Client is the entry point to the Datalastic API.
+// Defaults applied by NewClient before any Option runs.
+const (
+	defaultTimeout       = 30 * time.Second
+	defaultMaxRetries    = 3
+	defaultBackoffFactor = 500 * time.Millisecond
+	defaultRetryAfterMax = 60 * time.Second
+)
+
+// Client is the entry point to the Datalastic API. A Client is safe for
+// concurrent use; all of its configuration is fixed at construction.
 type Client struct {
 	apiKey     string
 	baseV0     string
 	baseExt    string
 	baseMR     string
 	httpClient *http.Client
+
+	// Retry configuration, validated once in NewClient and never re-checked
+	// in the request path.
+	maxRetries    int
+	backoffFactor time.Duration
+	retryAfterMax time.Duration
+	retryStatuses map[int]struct{}
+
+	// sleep and now are seams so tests can exercise the retry loop without
+	// waiting and with a fixed clock.
+	sleep func(time.Duration)
+	now   func() time.Time
+
+	// optErr holds the first option validation failure. NewClient returns it
+	// instead of a Client.
+	optErr error
 
 	Vessels *VesselsResource
 	Ports   *PortsResource
@@ -39,25 +64,101 @@ type Client struct {
 	Reports *ReportsResource
 }
 
-// Option configures a Client.
+// Option configures a Client. An option given an invalid value records a
+// construction error which NewClient returns; options never panic and never
+// silently substitute a corrected value.
 type Option func(*Client)
 
+// fail records the first option validation error.
+func (c *Client) fail(format string, args ...interface{}) {
+	if c.optErr == nil {
+		c.optErr = &DatalasticError{Message: fmt.Sprintf(format, args...)}
+	}
+}
+
 // WithTimeout sets a request timeout. It clones the underlying http.Client so a
-// shared client is never mutated.
+// shared client is never mutated. The timeout must be greater than zero: a zero
+// timeout means "wait forever", which is never what a caller intends when
+// setting one explicitly.
 func WithTimeout(d time.Duration) Option {
 	return func(c *Client) {
+		if d <= 0 {
+			c.fail("WithTimeout: timeout must be greater than zero, got %s", d)
+			return
+		}
 		cloned := *c.httpClient
 		cloned.Timeout = d
 		c.httpClient = &cloned
 	}
 }
 
-// WithHTTPClient replaces the underlying http.Client.
+// WithHTTPClient replaces the underlying http.Client. The client must not be
+// nil.
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) {
-		if hc != nil {
-			c.httpClient = hc
+		if hc == nil {
+			c.fail("WithHTTPClient: http client must not be nil")
+			return
 		}
+		c.httpClient = hc
+	}
+}
+
+// WithMaxRetries sets how many times a failed request is retried after the
+// first attempt. The default is 3. Zero disables retries entirely. Negative
+// values are a construction error.
+func WithMaxRetries(n int) Option {
+	return func(c *Client) {
+		if n < 0 {
+			c.fail("WithMaxRetries: max retries must not be negative, got %d", n)
+			return
+		}
+		c.maxRetries = n
+	}
+}
+
+// WithBackoffFactor sets the base delay for exponential backoff. The wait
+// before the zero-based retry attempt n is factor * 2^n, capped by the
+// Retry-After ceiling. The default is 500ms. Zero means no backoff wait.
+// Negative values are a construction error.
+func WithBackoffFactor(d time.Duration) Option {
+	return func(c *Client) {
+		if d < 0 {
+			c.fail("WithBackoffFactor: backoff factor must not be negative, got %s", d)
+			return
+		}
+		c.backoffFactor = d
+	}
+}
+
+// WithRetryAfterMax sets the ceiling for every retry wait, whether it comes
+// from a Retry-After header or from exponential backoff. The default is 60s.
+// Zero makes every wait zero. Negative values are a construction error.
+func WithRetryAfterMax(d time.Duration) Option {
+	return func(c *Client) {
+		if d < 0 {
+			c.fail("WithRetryAfterMax: retry-after ceiling must not be negative, got %s", d)
+			return
+		}
+		c.retryAfterMax = d
+	}
+}
+
+// WithRetryOnStatus replaces the set of HTTP status codes that trigger a retry.
+// The default is 429 alone. Only codes accepted by IsRetryableStatus are
+// allowed; anything else is a construction error. Calling it with no arguments
+// disables status-based retries.
+func WithRetryOnStatus(codes ...int) Option {
+	return func(c *Client) {
+		set := make(map[int]struct{}, len(codes))
+		for _, code := range codes {
+			if !IsRetryableStatus(code) {
+				c.fail("WithRetryOnStatus: status code %d is not retryable; allowed codes are 408, 429, and 500-599", code)
+				return
+			}
+			set[code] = struct{}{}
+		}
+		c.retryStatuses = set
 	}
 }
 
@@ -71,22 +172,36 @@ func withBaseURLs(base string) Option {
 	}
 }
 
-// NewClient creates a Client. It returns an error if apiKey is empty.
+// NewClient creates a Client. It returns an error if apiKey is empty or if any
+// option was given an invalid value; on error the returned Client is nil.
 func NewClient(apiKey string, opts ...Option) (*Client, error) {
 	if strings.TrimSpace(apiKey) == "" {
 		return nil, &DatalasticError{Message: "api key must not be empty"}
 	}
 
 	c := &Client{
-		apiKey:     apiKey,
-		baseV0:     BaseV0,
-		baseExt:    BaseExt,
-		baseMR:     BaseMR,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		apiKey:        apiKey,
+		baseV0:        BaseV0,
+		baseExt:       BaseExt,
+		baseMR:        BaseMR,
+		httpClient:    &http.Client{Timeout: defaultTimeout},
+		maxRetries:    defaultMaxRetries,
+		backoffFactor: defaultBackoffFactor,
+		retryAfterMax: defaultRetryAfterMax,
+		retryStatuses: map[int]struct{}{http.StatusTooManyRequests: {}},
+		sleep:         time.Sleep,
+		now:           time.Now,
 	}
 
-	for _, opt := range opts {
+	for i, opt := range opts {
+		if opt == nil {
+			c.fail("NewClient: option %d must not be nil", i)
+			continue
+		}
 		opt(c)
+	}
+	if c.optErr != nil {
+		return nil, c.optErr
 	}
 
 	c.Vessels = &VesselsResource{client: c}
@@ -101,12 +216,7 @@ func NewClient(apiKey string, opts ...Option) (*Client, error) {
 // envelope is the standard API response wrapper.
 type envelope struct {
 	Data json.RawMessage `json:"data"`
-	Meta struct {
-		Duration interface{} `json:"duration"`
-		Endpoint string      `json:"endpoint"`
-		Success  bool        `json:"success"`
-		Next     string      `json:"next"`
-	} `json:"meta"`
+	Meta Meta            `json:"meta"`
 }
 
 // errorBody attempts to parse a structured error message from a response body.
@@ -119,116 +229,171 @@ type errorBody struct {
 	Error   string `json:"error"`
 }
 
-// do executes a GET request against base+path and returns the parsed data
-// payload. Authentication is sent via the x-api-key header.
-func (c *Client) do(base, path string, params url.Values) (json.RawMessage, error) {
-	raw, _, err := c.doWithNext(base, path, params)
-	return raw, err
+// attemptResult is the outcome of a single round trip that reached the server.
+type attemptResult struct {
+	status     int
+	body       []byte
+	retryAfter string
+	readErr    error
 }
 
-// doWithNext executes a GET request like do() but also returns the meta.next
-// pagination token from the response envelope.
-func (c *Client) doWithNext(base, path string, params url.Values) (json.RawMessage, string, error) {
+// do executes a GET request against base+path and returns the data payload and
+// the response envelope metadata.
+func (c *Client) do(base, path string, params url.Values) (json.RawMessage, *Meta, error) {
 	if params == nil {
 		params = url.Values{}
 	}
-
-	fullURL := strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
-	fullURL += "?" + params.Encode()
-
-	req, err := http.NewRequest("GET", fullURL, nil)
-	if err != nil {
-		return nil, "", &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("request failed: %v", redactKey(err.Error(), c.apiKey))}}
-	}
-	req.Header.Set("x-api-key", c.apiKey)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, "", &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("request failed: %v", redactKey(err.Error(), c.apiKey))}}
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to read response body: %v", err)}, StatusCode: resp.StatusCode}
-	}
-
-	return parseResponseFull(resp.StatusCode, body)
+	return c.request(http.MethodGet, joinURL(base, path)+"?"+params.Encode(), nil)
 }
 
-// post executes a POST request with a JSON body. The api-key is sent in the
-// x-api-key header.
-func (c *Client) post(base, path string, body map[string]interface{}) (json.RawMessage, error) {
+// post executes a POST request with a JSON body and returns the data payload
+// and the response envelope metadata.
+func (c *Client) post(base, path string, body map[string]interface{}) (json.RawMessage, *Meta, error) {
 	if body == nil {
 		body = map[string]interface{}{}
 	}
-
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to encode request body: %v", err)}}
+		return nil, nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to encode request body: %v", redactKey(err.Error(), c.apiKey))}}
+	}
+	return c.request(http.MethodPost, joinURL(base, path), payload)
+}
+
+// request is the single request path for every endpoint: it performs the round
+// trip, applies the retry policy, and parses the response envelope.
+//
+// GET is idempotent, so transport failures and failed body reads are retried.
+// POST is not: the server may have created a report job before the connection
+// broke, so for POST only responses with a retryable status are repeated,
+// because a status means the server answered without acting.
+func (c *Client) request(method, fullURL string, payload []byte) (json.RawMessage, *Meta, error) {
+	retryNetwork := method == http.MethodGet
+
+	for attempt := 0; ; attempt++ {
+		res, err := c.attempt(method, fullURL, payload)
+		if err != nil {
+			if retryNetwork && attempt < c.maxRetries && isRetryableNetworkError(err) {
+				c.sleep(backoffDelay(c.backoffFactor, attempt, c.retryAfterMax))
+				continue
+			}
+			return nil, nil, &APIError{DatalasticError: DatalasticError{
+				Message: fmt.Sprintf("request failed after %d attempt(s): %v", attempt+1, redactKey(err.Error(), c.apiKey)),
+			}}
+		}
+
+		if attempt < c.maxRetries && c.retriesStatus(res.status) {
+			c.sleep(c.retryDelay(attempt, res.retryAfter))
+			continue
+		}
+
+		if res.readErr != nil {
+			// A body that failed or stopped short mid-read is the same class
+			// of failure as a broken connection, so it follows the same
+			// policy: retried on GET when the cause is retryable, never on
+			// POST. attempt() has already closed the failed body.
+			if retryNetwork && attempt < c.maxRetries && isRetryableNetworkError(res.readErr) {
+				c.sleep(backoffDelay(c.backoffFactor, attempt, c.retryAfterMax))
+				continue
+			}
+			// The message names the read failure, which is the proximate
+			// cause, but the type and StatusCode follow the status the server
+			// sent: a truncated body on a 429 is still a rate limit, and a
+			// caller matching *RateLimitError must not miss it.
+			msg := fmt.Sprintf("failed to read response body after %d attempt(s): %v", attempt+1, redactKey(res.readErr.Error(), c.apiKey))
+			return nil, nil, statusError(res.status, msg)
+		}
+
+		return parseResponse(res.status, res.body, c.apiKey)
+	}
+}
+
+// attempt performs one round trip. The response body is always drained and
+// closed before returning so the connection can be reused by a retry.
+func (c *Client) attempt(method, fullURL string, payload []byte) (*attemptResult, error) {
+	var body io.Reader
+	if payload != nil {
+		// A fresh reader per attempt: a consumed one would send an empty body.
+		body = bytes.NewReader(payload)
 	}
 
-	fullURL := strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
-
-	req, err := http.NewRequest("POST", fullURL, bytes.NewReader(payload))
+	req, err := http.NewRequest(method, fullURL, body)
 	if err != nil {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("request failed: %v", redactKey(err.Error(), c.apiKey))}}
+		return nil, &nonRetryableError{err}
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("x-api-key", c.apiKey)
+	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("request failed: %v", redactKey(err.Error(), c.apiKey))}}
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	rb, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to read response body: %v", err)}, StatusCode: resp.StatusCode}
-	}
-
-	return parseResponse(resp.StatusCode, rb)
+	raw, readErr := io.ReadAll(resp.Body)
+	return &attemptResult{
+		status:     resp.StatusCode,
+		body:       raw,
+		retryAfter: resp.Header.Get("Retry-After"),
+		readErr:    readErr,
+	}, nil
 }
 
 // parseResponse maps HTTP status codes to typed errors and validates the
-// response envelope, returning only the data payload.
-func parseResponse(status int, body []byte) (json.RawMessage, error) {
-	data, _, err := parseResponseFull(status, body)
-	return data, err
-}
-
-// parseResponseFull maps HTTP status codes to typed errors and validates the
-// response envelope, returning the data payload and the meta.next pagination
-// token.
-func parseResponseFull(status int, body []byte) (json.RawMessage, string, error) {
+// response envelope, returning the data payload and the envelope metadata.
+//
+// Order of checks: status code, then an explicit meta.success of false (the API
+// can report failure on HTTP 200), then the presence of a data payload.
+//
+// apiKey is only used to redact the key from a decoder error message.
+func parseResponse(status int, body []byte, apiKey string) (json.RawMessage, *Meta, error) {
 	if status >= 400 {
-		msg := extractErrorMessage(body, status)
-		base := DatalasticError{Message: msg}
-		switch status {
-		case http.StatusUnauthorized:
-			return nil, "", &AuthenticationError{DatalasticError: base, StatusCode: status}
-		case http.StatusPaymentRequired:
-			return nil, "", &InsufficientCreditsError{DatalasticError: base, StatusCode: status}
-		case http.StatusNotFound:
-			return nil, "", &NotFoundError{DatalasticError: base, StatusCode: status}
-		case http.StatusTooManyRequests:
-			return nil, "", &RateLimitError{DatalasticError: base, StatusCode: status}
-		default:
-			return nil, "", &APIError{DatalasticError: base, StatusCode: status}
-		}
+		return nil, nil, statusError(status, extractErrorMessage(body, status))
 	}
 
 	var env envelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, "", &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("invalid JSON response: %v", err)}, StatusCode: status}
+		return nil, nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("invalid JSON response: %v", redactKey(err.Error(), apiKey))}, StatusCode: status}
+	}
+	meta := &env.Meta
+
+	if meta.Success != nil && !*meta.Success {
+		msg := "API reported failure"
+		if meta.Message != "" {
+			msg += ": " + meta.Message
+		}
+		return nil, nil, &APIError{DatalasticError: DatalasticError{Message: msg}, StatusCode: status}
 	}
 
 	if len(env.Data) == 0 || string(env.Data) == "null" {
-		return nil, "", &APIError{DatalasticError: DatalasticError{Message: "response missing 'data' field"}, StatusCode: status}
+		return nil, nil, &APIError{DatalasticError: DatalasticError{Message: "response missing 'data' field"}, StatusCode: status}
 	}
 
-	return env.Data, env.Meta.Next, nil
+	return env.Data, meta, nil
+}
+
+// statusError builds the typed error a status code implies, carrying msg as its
+// message. It is the single source of truth for the status-to-type mapping:
+// parseResponse uses it for an error response, and request() uses it so that a
+// failed body read still surfaces the type the status implies rather than a
+// generic *APIError. Any status without a dedicated type, including every 5xx
+// and any non-error status, maps to *APIError.
+func statusError(status int, msg string) error {
+	base := DatalasticError{Message: msg}
+	switch status {
+	case http.StatusUnauthorized:
+		return &AuthenticationError{DatalasticError: base, StatusCode: status}
+	case http.StatusPaymentRequired:
+		return &InsufficientCreditsError{DatalasticError: base, StatusCode: status}
+	case http.StatusNotFound:
+		return &NotFoundError{DatalasticError: base, StatusCode: status}
+	case http.StatusTooManyRequests:
+		return &RateLimitError{DatalasticError: base, StatusCode: status}
+	default:
+		return &APIError{DatalasticError: base, StatusCode: status}
+	}
 }
 
 // extractErrorMessage pulls a human-readable message from an error body, falling
@@ -268,15 +433,16 @@ func extractErrorMessage(body []byte, status int) string {
 
 // Stat returns API key usage statistics.
 func (c *Client) Stat() (*ApiStat, error) {
-	raw, err := c.do(c.baseV0, "stat", nil)
+	raw, meta, err := c.do(c.baseV0, "stat", nil)
 	if err != nil {
 		return nil, err
 	}
-	var out ApiStat
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, &APIError{DatalasticError: DatalasticError{Message: fmt.Sprintf("failed to decode stat: %v", err)}}
+	out, err := decodeInto[ApiStat](raw, "stat", c.apiKey)
+	if err != nil {
+		return nil, err
 	}
-	return &out, nil
+	out.Meta = meta
+	return out, nil
 }
 
 // redactKey replaces every occurrence of key in s with "[REDACTED]" so that
@@ -288,11 +454,16 @@ func redactKey(s, key string) string {
 	return strings.ReplaceAll(s, key, "[REDACTED]")
 }
 
+// joinURL concatenates a base URL and a path with exactly one separator.
+func joinURL(base, path string) string {
+	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
+}
+
 // --- shared parameter helpers ---
 
 func addOptionalInt(p url.Values, key string, v *int) {
 	if v != nil {
-		p.Set(key, fmt.Sprintf("%d", *v))
+		p.Set(key, strconv.Itoa(*v))
 	}
 }
 

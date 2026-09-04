@@ -33,7 +33,14 @@ type PortGetParams struct {
 }
 
 // Find searches the port database. At least one search parameter is required.
+// It is FindWithMeta without the response metadata.
 func (r *PortsResource) Find(p PortFindParams) ([]Port, error) {
+	ports, _, err := r.FindWithMeta(p)
+	return ports, err
+}
+
+// FindWithMeta is Find, additionally returning the response envelope metadata.
+func (r *PortsResource) FindWithMeta(p PortFindParams) ([]Port, *Meta, error) {
 	v := url.Values{}
 	addOptionalInt(v, "fuzzy", p.Fuzzy)
 
@@ -66,14 +73,18 @@ func (r *PortsResource) Find(p PortFindParams) ([]Port, error) {
 	}
 
 	if searchCount == 0 {
-		return nil, &DatalasticError{Message: "at least one search parameter is required (fuzzy and radius do not count)"}
+		return nil, nil, &DatalasticError{Message: "at least one search parameter is required (fuzzy and radius do not count)"}
 	}
 
-	raw, err := r.client.do(r.client.baseV0, "port_find", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "port_find", v)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return decodeSlice[Port](raw, "port_find")
+	ports, err := decodeSlice[Port](raw, "port_find", r.client.apiKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ports, meta, nil
 }
 
 // Get returns full detail for a single port, including terminals.
@@ -90,9 +101,14 @@ func (r *PortsResource) Get(p PortGetParams) (*PortDetail, error) {
 	addOptionalFloat(v, "lon", p.Lon)
 	addOptionalFloat(v, "radius", p.Radius)
 
-	raw, err := r.client.do(r.client.baseV0, "port", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "port", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[PortDetail](raw, "port")
+	out, err := decodeInto[PortDetail](raw, "port", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }

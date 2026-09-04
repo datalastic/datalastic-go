@@ -1,7 +1,6 @@
 package datalastic
 
 import (
-	"encoding/json"
 	"net/url"
 )
 
@@ -71,49 +70,72 @@ type CompanyParams struct {
 	UpdatedFrom string
 }
 
-// DryDock returns dry-dock and survey records.
+// DryDock returns dry-dock and survey records. It is DryDockWithMeta without
+// the response metadata.
 func (r *IntelResource) DryDock(p IntelDryDockParams) ([]DryDockRecord, error) {
+	records, _, err := r.DryDockWithMeta(p)
+	return records, err
+}
+
+// DryDockWithMeta is DryDock, additionally returning the response envelope
+// metadata.
+func (r *IntelResource) DryDockWithMeta(p IntelDryDockParams) ([]DryDockRecord, *Meta, error) {
 	v := url.Values{}
 	addString(v, "imo", p.IMO)
 	addString(v, "name", p.Name)
 	addString(v, "dry_dock_from", p.DryDockFrom)
 	addString(v, "dry_dock_to", p.DryDockTo)
-	raw, err := r.client.do(r.client.baseMR, "dry_dock_dates", v)
-	if err != nil {
-		return nil, err
-	}
-	return decodeSlice[DryDockRecord](raw, "dry_dock_dates")
+	return intelSlice[DryDockRecord](r, "dry_dock_dates", v)
 }
 
-// Casualties returns casualty records.
+// Casualties returns casualty records. It is CasualtiesWithMeta without the
+// response metadata.
 func (r *IntelResource) Casualties(p IntelDateRangeParams) ([]CasualtyRecord, error) {
-	raw, err := r.dateRange("casualty", p)
-	if err != nil {
-		return nil, err
-	}
-	return decodeSlice[CasualtyRecord](raw, "casualty")
+	records, _, err := r.CasualtiesWithMeta(p)
+	return records, err
 }
 
-// Inspections returns port-state-control inspection records.
+// CasualtiesWithMeta is Casualties, additionally returning the response
+// envelope metadata.
+func (r *IntelResource) CasualtiesWithMeta(p IntelDateRangeParams) ([]CasualtyRecord, *Meta, error) {
+	return intelSlice[CasualtyRecord](r, "casualty", dateRangeValues(p))
+}
+
+// Inspections returns port-state-control inspection records. It is
+// InspectionsWithMeta without the response metadata.
 func (r *IntelResource) Inspections(p IntelDateRangeParams) ([]InspectionRecord, error) {
-	raw, err := r.dateRange("inspections", p)
-	if err != nil {
-		return nil, err
-	}
-	return decodeSlice[InspectionRecord](raw, "inspections")
+	records, _, err := r.InspectionsWithMeta(p)
+	return records, err
 }
 
-// SPD returns sales, purchase, and demolition records.
+// InspectionsWithMeta is Inspections, additionally returning the response
+// envelope metadata.
+func (r *IntelResource) InspectionsWithMeta(p IntelDateRangeParams) ([]InspectionRecord, *Meta, error) {
+	return intelSlice[InspectionRecord](r, "inspections", dateRangeValues(p))
+}
+
+// SPD returns sales, purchase, and demolition records. It is SPDWithMeta
+// without the response metadata.
 func (r *IntelResource) SPD(p IntelDateRangeParams) ([]SPDRecord, error) {
-	raw, err := r.dateRange("spd", p)
-	if err != nil {
-		return nil, err
-	}
-	return decodeSlice[SPDRecord](raw, "spd")
+	records, _, err := r.SPDWithMeta(p)
+	return records, err
 }
 
-// Ownership returns beneficial owner and management records.
+// SPDWithMeta is SPD, additionally returning the response envelope metadata.
+func (r *IntelResource) SPDWithMeta(p IntelDateRangeParams) ([]SPDRecord, *Meta, error) {
+	return intelSlice[SPDRecord](r, "spd", dateRangeValues(p))
+}
+
+// Ownership returns beneficial owner and management records. It is
+// OwnershipWithMeta without the response metadata.
 func (r *IntelResource) Ownership(p OwnershipParams) ([]OwnershipRecord, error) {
+	records, _, err := r.OwnershipWithMeta(p)
+	return records, err
+}
+
+// OwnershipWithMeta is Ownership, additionally returning the response envelope
+// metadata.
+func (r *IntelResource) OwnershipWithMeta(p OwnershipParams) ([]OwnershipRecord, *Meta, error) {
 	v := url.Values{}
 	addString(v, "imo", p.IMO)
 	addString(v, "name", p.Name)
@@ -122,15 +144,19 @@ func (r *IntelResource) Ownership(p OwnershipParams) ([]OwnershipRecord, error) 
 	addString(v, "technical_manager", p.TechnicalManager)
 	addString(v, "commercial_manager", p.CommercialManager)
 	addString(v, "updated_from", p.UpdatedFrom)
-	raw, err := r.client.do(r.client.baseMR, "ownership", v)
-	if err != nil {
-		return nil, err
-	}
-	return decodeSlice[OwnershipRecord](raw, "ownership")
+	return intelSlice[OwnershipRecord](r, "ownership", v)
 }
 
-// ClassSociety returns classification society records.
+// ClassSociety returns classification society records. It is
+// ClassSocietyWithMeta without the response metadata.
 func (r *IntelResource) ClassSociety(p ClassSocietyParams) ([]ClassSocietyRecord, error) {
+	records, _, err := r.ClassSocietyWithMeta(p)
+	return records, err
+}
+
+// ClassSocietyWithMeta is ClassSociety, additionally returning the response
+// envelope metadata.
+func (r *IntelResource) ClassSocietyWithMeta(p ClassSocietyParams) ([]ClassSocietyRecord, *Meta, error) {
 	v := url.Values{}
 	addString(v, "imo", p.IMO)
 	addString(v, "name", p.Name)
@@ -140,46 +166,64 @@ func (r *IntelResource) ClassSociety(p ClassSocietyParams) ([]ClassSocietyRecord
 	addString(v, "technical_manager", p.TechnicalManager)
 	addString(v, "technical_manager_imo", p.TechnicalManagerIMO)
 	addString(v, "updated_from", p.UpdatedFrom)
-	raw, err := r.client.do(r.client.baseMR, "class_society", v)
-	if err != nil {
-		return nil, err
-	}
-	return decodeSlice[ClassSocietyRecord](raw, "class_society")
+	return intelSlice[ClassSocietyRecord](r, "class_society", v)
 }
 
-// Engine returns engine and propulsion records.
+// Engine returns engine and propulsion records. It is EngineWithMeta without
+// the response metadata.
 func (r *IntelResource) Engine(p EngineParams) ([]EngineRecord, error) {
+	records, _, err := r.EngineWithMeta(p)
+	return records, err
+}
+
+// EngineWithMeta is Engine, additionally returning the response envelope
+// metadata.
+func (r *IntelResource) EngineWithMeta(p EngineParams) ([]EngineRecord, *Meta, error) {
 	v := url.Values{}
 	addString(v, "imo", p.IMO)
 	addString(v, "name", p.Name)
 	addOptionalInt(v, "fuzzy", p.Fuzzy)
 	addString(v, "updated_from", p.UpdatedFrom)
-	raw, err := r.client.do(r.client.baseMR, "engine", v)
-	if err != nil {
-		return nil, err
-	}
-	return decodeSlice[EngineRecord](raw, "engine")
+	return intelSlice[EngineRecord](r, "engine", v)
 }
 
-// Companies returns maritime company records.
+// Companies returns maritime company records. It is CompaniesWithMeta without
+// the response metadata.
 func (r *IntelResource) Companies(p CompanyParams) ([]CompanyRecord, error) {
+	records, _, err := r.CompaniesWithMeta(p)
+	return records, err
+}
+
+// CompaniesWithMeta is Companies, additionally returning the response envelope
+// metadata.
+func (r *IntelResource) CompaniesWithMeta(p CompanyParams) ([]CompanyRecord, *Meta, error) {
 	v := url.Values{}
 	addString(v, "company_imo", p.CompanyIMO)
 	addString(v, "name", p.Name)
 	addString(v, "updated_from", p.UpdatedFrom)
-	raw, err := r.client.do(r.client.baseMR, "companies", v)
-	if err != nil {
-		return nil, err
-	}
-	return decodeSlice[CompanyRecord](raw, "companies")
+	return intelSlice[CompanyRecord](r, "companies", v)
 }
 
-// dateRange builds the shared query for vessel + from/to endpoints.
-func (r *IntelResource) dateRange(path string, p IntelDateRangeParams) (json.RawMessage, error) {
+// dateRangeValues builds the shared query for vessel + from/to endpoints.
+func dateRangeValues(p IntelDateRangeParams) url.Values {
 	v := url.Values{}
 	addString(v, "imo", p.IMO)
 	addString(v, "name", p.Name)
 	addString(v, "from", p.From)
 	addString(v, "to", p.To)
-	return r.client.do(r.client.baseMR, path, v)
+	return v
+}
+
+// intelSlice performs a maritime-reports GET and decodes the payload as a slice
+// of T, keeping the response envelope metadata.
+func intelSlice[T any](r *IntelResource, path string, v url.Values) ([]T, *Meta, error) {
+	raw, meta, err := r.client.do(r.client.baseMR, path, v)
+	if err != nil {
+		return nil, nil, err
+	}
+	records, err := decodeSlice[T](raw, path, r.client.apiKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	return records, meta, nil
 }

@@ -43,9 +43,14 @@ func (r *RoutesResource) Calculate(p RouteParams) (*SeaRoute, error) {
 	addString(v, "port_uuid_to", p.PortUUIDTo)
 	addString(v, "port_unlocode_to", p.PortUnlocodeTo)
 
-	raw, err := r.client.do(r.client.baseExt, "route", v)
+	raw, meta, err := r.client.do(r.client.baseExt, "route", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[SeaRoute](raw, "route")
+	out, err := decodeInto[SeaRoute](raw, "route", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }

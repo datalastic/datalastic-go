@@ -26,11 +26,16 @@ func (r *ReportsResource) Submit(p ReportSubmitParams) (*Report, error) {
 	for k, val := range p.Extra {
 		body[k] = val
 	}
-	raw, err := r.client.post(r.client.baseV0, "report", body)
+	raw, meta, err := r.client.post(r.client.baseV0, "report", body)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[Report](raw, "report")
+	out, err := decodeInto[Report](raw, "report", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }
 
 // Get returns the status and result of a single report job.
@@ -40,11 +45,16 @@ func (r *ReportsResource) Get(reportID string) (*Report, error) {
 	}
 	v := url.Values{}
 	v.Set("report_id", reportID)
-	raw, err := r.client.do(r.client.baseV0, "report", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "report", v)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[Report](raw, "report")
+	out, err := decodeInto[Report](raw, "report", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }
 
 // InRadiusHistoryParams describes an async historical area-scan report.
@@ -91,20 +101,37 @@ func (r *ReportsResource) InRadiusHistory(p InRadiusHistoryParams) (*Report, err
 	if p.PortUnlocode != "" {
 		body["port_unlocode"] = p.PortUnlocode
 	}
-	raw, err := r.client.post(r.client.baseV0, "report", body)
+	raw, meta, err := r.client.post(r.client.baseV0, "report", body)
 	if err != nil {
 		return nil, err
 	}
-	return decodeInto[Report](raw, "report")
+	out, err := decodeInto[Report](raw, "report", r.client.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	out.Meta = meta
+	return out, nil
 }
 
-// ListAll returns all report jobs for the API key.
+// ListAll returns all report jobs for the API key. It is ListAllWithMeta
+// without the response metadata.
 func (r *ReportsResource) ListAll() ([]Report, error) {
+	reports, _, err := r.ListAllWithMeta()
+	return reports, err
+}
+
+// ListAllWithMeta is ListAll, additionally returning the response envelope
+// metadata.
+func (r *ReportsResource) ListAllWithMeta() ([]Report, *Meta, error) {
 	v := url.Values{}
 	v.Set("report_id", "_all")
-	raw, err := r.client.do(r.client.baseV0, "report", v)
+	raw, meta, err := r.client.do(r.client.baseV0, "report", v)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return decodeSlice[Report](raw, "report")
+	reports, err := decodeSlice[Report](raw, "report", r.client.apiKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	return reports, meta, nil
 }
